@@ -161,6 +161,8 @@ private:
     QString resolvePlugin(QQmlTypeLoader *typeLoader,
                           const QString &qmldirPath, const QString &qmldirPluginPath,
                           const QString &baseName);
+    bool importPlugin(QObject *instance, const QString &basePath, const QString &uri,
+                          const QString &typeNamespace, bool initEngine, QList<QQmlError> *errors);
 
     struct QmldirCache {
         int versionMajor;

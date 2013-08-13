@@ -55,6 +55,8 @@
 #include <private/qqmltypenamecache_p.h>
 #include <private/qqmlengine_p.h>
 #include <private/qfieldlist_p.h>
+#include <QtCore/qjsonobject.h>
+#include <QtCore/qjsonarray.h>
 
 QT_BEGIN_NAMESPACE
 
@@ -739,25 +741,39 @@ bool QQmlImportsPrivate::importExtension(const QString &qmldirFilePath,
                                          const QQmlTypeLoader::QmldirContent *qmldir,
                                          QList<QQmlError> *errors)
 {
+#if !defined(QT_NO_LIBRARY)
     Q_ASSERT(qmldir);
 
     if (qmlImportTrace())
         qDebug().nospace() << "QQmlImports(" << qPrintable(base) << ")::importExtension: "
                            << "loaded " << qmldirFilePath;
 
+    int qmldirPluginCount = qmldir->plugins().count();
+    if (qmldirPluginCount == 0)
+        return true;
+
     if (!database->qmlDirFilesForWhichPluginsHaveBeenLoaded.contains(qmldirFilePath)) {
+        // First search for listed qmldir plugins dynamically. If we cannot resolve them all, we continue
+        // searching static plugins that has correct metadata uri. Note that since we only know the uri
+        // for a static plugin, and not the filename, we cannot know which static plugin belongs to which
+        // listed plugin inside qmldir. And for this reason, mixing dynamic and static plugins inside a
+        // single module is not recommended.
 
+        QString typeNamespace = qmldir->typeNamespace();
         QString qmldirPath = qmldirFilePath;
-
         int slash = qmldirPath.lastIndexOf(Slash);
         if (slash > 0)
             qmldirPath.truncate(slash);
 
+        int dynamicPluginsFound = 0;
+        int staticPluginsFound = 0;
+
+#if defined(QT_SHARED)
         foreach (const QQmlDirParser::Plugin &plugin, qmldir->plugins()) {
-            QString resolvedFilePath = database->resolvePlugin(typeLoader, qmldirPath,
-                                                               plugin.path, plugin.name);
+            QString resolvedFilePath = database->resolvePlugin(typeLoader, qmldirPath, plugin.path, plugin.name);
             if (!resolvedFilePath.isEmpty()) {
-                if (!database->importPlugin(resolvedFilePath, uri, qmldir->typeNamespace(), errors)) {
+                dynamicPluginsFound++;
+                if (!database->importPlugin(resolvedFilePath, uri, typeNamespace, errors)) {
                     if (errors) {
                         // XXX TODO: should we leave the import plugin error alone?
                         // Here, we pop it off the top and coalesce it into this error's message.
@@ -770,20 +786,65 @@ bool QQmlImportsPrivate::importExtension(const QString &qmldirFilePath,
                     }
                     return false;
                 }
-            } else {
-                if (errors) {
-                    QQmlError error;
-                    error.setDescription(QQmlImportDatabase::tr("module \"%1\" plugin \"%2\" not found").arg(uri).arg(plugin.name));
-                    error.setUrl(QUrl::fromLocalFile(qmldirFilePath));
-                    errors->prepend(error);
-                }
-                return false;
             }
+        }
+#endif // QT_SHARED
+
+        if (dynamicPluginsFound < qmldirPluginCount) {
+            // Check if the missing plugins can be resolved statically:
+            const QString basePath = QFileInfo(qmldirPath).absoluteFilePath();
+            foreach (const QStaticPlugin &plugin, QPluginLoader::staticPlugins()) {
+                if (QQmlExtensionPlugin *instance = qobject_cast<QQmlExtensionPlugin *>(plugin.instance())) {
+                    // A plugin can be set up to handle multiple URIs, so go through the list:
+                    const QJsonArray metaDataUriList = plugin.metaData().value(QLatin1String("uriList")).toArray();
+                    if (metaDataUriList.isEmpty()) {
+                        if (errors) {
+                            QQmlError error;
+                            error.setDescription(QQmlImportDatabase::tr("static plugin for module \"%1\" with name \"%2\" has no metadata URI").arg(uri).arg(instance->metaObject()->className()));
+                            error.setUrl(QUrl::fromLocalFile(qmldirFilePath));
+                            errors->prepend(error);
+                        }
+                        return false;
+                    }
+                    foreach (const QJsonValue &metaDataUri, metaDataUriList) {
+                        if (metaDataUri.toString() == uri) {
+                            staticPluginsFound++;
+                            if (!database->importPlugin(instance, basePath, uri, typeNamespace, true, errors)) {
+                                if (errors) {
+                                    QQmlError poppedError = errors->takeFirst();
+                                    QQmlError error;
+                                    error.setDescription(QQmlImportDatabase::tr("static plugin for module \"%1\" with name \"%2\" cannot be loaded: %3").arg(uri).arg(instance->metaObject()->className()).arg(poppedError.description()));
+                                    error.setUrl(QUrl::fromLocalFile(qmldirFilePath));
+                                    errors->prepend(error);
+                                }
+                                return false;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if ((dynamicPluginsFound + staticPluginsFound) < qmldirPluginCount) {
+            if (errors) {
+                QQmlError error;
+                if (qmldirPluginCount > 1 && staticPluginsFound > 0)
+                    error.setDescription(QQmlImportDatabase::tr("could not resolve all plugins for module \"%1\"").arg(uri));
+                else
+                    error.setDescription(QQmlImportDatabase::tr("module \"%1\" plugin \"%2\" not found").arg(uri).arg(qmldir->plugins()[dynamicPluginsFound].name));
+                error.setUrl(QUrl::fromLocalFile(qmldirFilePath));
+                errors->prepend(error);
+            }
+            return false;
         }
 
         database->qmlDirFilesForWhichPluginsHaveBeenLoaded.insert(qmldirFilePath);
     }
 
+#else
+    return false;
+#endif // QT_NO_LIBRARY
     return true;
 }
 
@@ -1621,11 +1682,95 @@ void QQmlImportDatabase::setImportPathList(const QStringList &paths)
 /*!
     \internal
 */
-bool QQmlImportDatabase::importPlugin(const QString &filePath, const QString &uri, const QString &typeNamespace, QList<QQmlError> *errors)
+bool QQmlImportDatabase::importPlugin(QObject *instance, const QString &basePath,
+                                      const QString &uri, const QString &typeNamespace,
+                                      bool initEngine, QList<QQmlError> *errors)
 {
     if (qmlImportTrace())
-        qDebug().nospace() << "QQmlImportDatabase::importPlugin: " << uri << " from " << filePath;
+        qDebug().nospace() << "QQmlImportDatabase::importPluginInstance: " << uri << " from " << basePath;
 
+    QQmlTypesExtensionInterface *iface = qobject_cast<QQmlTypesExtensionInterface *>(instance);
+    if (!iface) {
+        if (errors) {
+            QQmlError error;
+            error.setDescription(tr("Module loaded for URI '%1' does not implement QQmlTypesExtensionInterface").arg(typeNamespace));
+            errors->prepend(error);
+        }
+        return false;
+    }
+
+    const QByteArray bytes = uri.toUtf8();
+    const char *moduleId = bytes.constData();
+
+    QStringList registrationFailures;
+
+    QWriteLocker lock(QQmlMetaType::typeRegistrationLock());
+
+    if (!typeNamespace.isEmpty()) {
+        // This is an 'identified' module
+        if (typeNamespace != uri) {
+            // The namespace for type registrations must match the URI for locating the module
+            QQmlError error;
+            error.setDescription(tr("Module namespace '%1' does not match import URI '%2'").arg(typeNamespace).arg(uri));
+            errors->prepend(error);
+            return false;
+        }
+
+        if (QQmlMetaType::namespaceContainsRegistrations(typeNamespace)) {
+            // Other modules have already installed to this namespace
+            QQmlError error;
+            error.setDescription(tr("Namespace '%1' has already been used for type registration").arg(typeNamespace));
+            errors->prepend(error);
+            return false;
+        } else {
+            QQmlMetaType::protectNamespace(typeNamespace);
+        }
+    } else {
+        // This is not an identified module - provide a warning
+        qWarning().nospace() << qPrintable(tr("Module '%1' does not contain a module identifier directive - it cannot be protected from external registrations.").arg(uri));
+    }
+
+    QQmlMetaType::setTypeRegistrationNamespace(typeNamespace);
+
+    if (QQmlExtensionPlugin *plugin = qobject_cast<QQmlExtensionPlugin *>(instance)) {
+        // basepath should point to the directory of the module, not the plugin file itself:
+        QQmlExtensionPluginPrivate::get(plugin)->baseUrl = QUrl::fromLocalFile(basePath);
+    }
+
+    iface->registerTypes(moduleId);
+
+    registrationFailures = QQmlMetaType::typeRegistrationFailures();
+    QQmlMetaType::setTypeRegistrationNamespace(QString());
+
+    if (!registrationFailures.isEmpty()) {
+        if (errors) {
+            QQmlError error;
+            error.setDescription(tr("Error when registering types for plugin with URI '%1'").arg(typeNamespace));
+            errors->prepend(error);
+            foreach (const QString &failure, registrationFailures) {
+                QQmlError error;
+                error.setDescription(failure);
+                errors->prepend(error);
+            }
+        }
+        return false;
+    }
+
+    if (initEngine) {
+        if (QQmlExtensionInterface *eiface = qobject_cast<QQmlExtensionInterface *>(instance)) {
+            QQmlEnginePrivate *ep = QQmlEnginePrivate::get(engine);
+            ep->typeLoader.initializeEngine(eiface, moduleId);
+        }
+    }
+
+    return true;
+}
+
+/*!
+    \internal
+*/
+bool QQmlImportDatabase::importPlugin(const QString &filePath, const QString &uri, const QString &typeNamespace, QList<QQmlError> *errors)
+{
 #ifndef QT_NO_LIBRARY
     QFileInfo fileInfo(filePath);
     const QString absoluteFilePath = fileInfo.absoluteFilePath();
@@ -1660,85 +1805,25 @@ bool QQmlImportDatabase::importPlugin(const QString &filePath, const QString &ur
         }
 
         QObject *instance = loader.instance();
-        if (QQmlTypesExtensionInterface *iface = qobject_cast<QQmlExtensionInterface *>(instance)) {
 
-            const QByteArray bytes = uri.toUtf8();
-            const char *moduleId = bytes.constData();
-            if (!typesRegistered) {
-
-                qmlEnginePluginsWithRegisteredTypes()->insert(absoluteFilePath, uri);
-
-                QStringList registrationFailures;
-
-                {
-                    QWriteLocker lock(QQmlMetaType::typeRegistrationLock());
-
-                    if (!typeNamespace.isEmpty()) {
-                        // This is an 'identified' module
-                        if (typeNamespace != uri) {
-                            // The namespace for type registrations must match the URI for locating the module
-                            QQmlError error;
-                            error.setDescription(tr("Module namespace '%1' does not match import URI '%2'").arg(typeNamespace).arg(uri));
-                            errors->prepend(error);
-                            return false;
-                        }
-
-                        if (QQmlMetaType::namespaceContainsRegistrations(typeNamespace)) {
-                            // Other modules have already installed to this namespace
-                            QQmlError error;
-                            error.setDescription(tr("Namespace '%1' has already been used for type registration").arg(typeNamespace));
-                            errors->prepend(error);
-                            return false;
-                        } else {
-                            QQmlMetaType::protectNamespace(typeNamespace);
-                        }
-                    } else {
-                        // This is not an identified module - provide a warning
-                        qWarning().nospace() << qPrintable(tr("Module '%1' does not contain a module identifier directive - it cannot be protected from external registrations.").arg(uri));
-                    }
-
-                    QQmlMetaType::setTypeRegistrationNamespace(typeNamespace);
-
-                    if (QQmlExtensionPlugin *plugin = qobject_cast<QQmlExtensionPlugin *>(instance)) {
-                        // Set the directory, not the library file itself
-                        QQmlExtensionPluginPrivate::get(plugin)->baseUrl = QUrl::fromLocalFile(fileInfo.absolutePath());
-                    }
-                    iface->registerTypes(moduleId);
-
-                    registrationFailures = QQmlMetaType::typeRegistrationFailures();
-                    QQmlMetaType::setTypeRegistrationNamespace(QString());
-                }
-
-                if (!registrationFailures.isEmpty()) {
-                    foreach (const QString &failure, registrationFailures) {
-                        QQmlError error;
-                        error.setDescription(failure);
-                        errors->prepend(error);
-                    }
-                    return false;
-                }
-            }
-            if (!engineInitialized) {
-                // things on the engine (eg. adding new global objects) have to be done for every 
-                // engine.  
-                // XXX protect against double initialization
-                initializedPlugins.insert(absoluteFilePath);
-
-                QQmlExtensionInterface *eiface = 
-                    qobject_cast<QQmlExtensionInterface *>(instance);
-                if (eiface) {
-                    QQmlEnginePrivate *ep = QQmlEnginePrivate::get(engine);
-                    ep->typeLoader.initializeEngine(eiface, moduleId);
-                }
-            }
-        } else {
-            if (errors) {
-                QQmlError error;
-                error.setDescription(loader.errorString());
-                errors->prepend(error);
-            }
-            return false;
+        if (!typesRegistered) {
+            qmlEnginePluginsWithRegisteredTypes()->insert(absoluteFilePath, uri);
+            if (!importPlugin(instance, fileInfo.absolutePath(), uri, typeNamespace, false, errors))
+                return false;
         }
+
+        if (!engineInitialized) {
+             // things on the engine (eg. adding new global objects) have to be done for every
+             // engine.
+             // XXX protect against double initialization
+             initializedPlugins.insert(absoluteFilePath);
+
+             if (QQmlExtensionInterface *eiface = qobject_cast<QQmlExtensionInterface *>(instance)) {
+                 QQmlEnginePrivate *ep = QQmlEnginePrivate::get(engine);
+                 const char *moduleId = uri.toUtf8().constData();
+                 ep->typeLoader.initializeEngine(eiface, moduleId);
+             }
+         }
     }
 
     return true;
